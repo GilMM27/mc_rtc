@@ -1,4 +1,4 @@
-# TVM SSM+PFL acceleration constraint with fixed region/link pairs.
+# TVM position-level distance function with an SSM+PFL speed dynamic.
 # The controller supplies a complete fresh snapshot and clears the constraint
 # and skips the QP whenever the snapshot is unavailable or invalid.
 # Weight is optional and penalizes per-pair speed slack in m/s.
