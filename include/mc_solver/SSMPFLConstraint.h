@@ -9,9 +9,16 @@
 
 namespace mc_solver
 {
-/** TVM SSM + PFL acceleration constraint with fixed region/link pairs.
- * Each row limits the next-step robot approach speed using a sampled
- * directional distance, human speed, and PFL budget.
+namespace details { class DistanceFunction; }
+
+/** TVM SSM + PFL speed constraint with a fixed number of region/link pairs.
+ *
+ * Each measured distance is represented by a sampled position-level function;
+ * an order-two task dynamic limits next-step robot approach speed. The local
+ * model holds the measured witness, normal and human velocity fixed during a
+ * controller step. A moving human can reduce the robot approach budget to zero.
+ * This directional model does not bound tangential point velocity or contact
+ * force. A positive weight enables one-sided soft speed slack in m/s.
  */
 struct MC_SOLVER_DLLAPI SSMPFLConstraint : public ConstraintSet
 {
@@ -52,8 +59,10 @@ private:
   void toggleMonitor(size_t row);
   double pairValue(size_t row, bool budget) const;
   double weight_;
+  double dt_;
+  tvm::VariablePtr slackRoot_;
   tvm::VariablePtr slack_;
-  mc_tvm::SSMPFLFunctionPtr function_;
+  std::shared_ptr<details::DistanceFunction> function_;
   tvm::TaskWithRequirementsPtr task_;
   tvm::TaskWithRequirementsPtr slackBound_;
   tvm::TaskWithRequirementsPtr slackObjective_;

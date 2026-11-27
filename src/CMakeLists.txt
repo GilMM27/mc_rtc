@@ -455,6 +455,7 @@ set(mc_solver_SRC
     mc_solver/KinematicsConstraint.cpp
     mc_solver/QPSolver.cpp
     mc_solver/SSMPFLConstraint.cpp
+    mc_solver/SSMPFLPositionFunction.h
     mc_solver/TasksQPSolver.cpp
     mc_solver/TVMQPSolver.cpp
     mc_solver/Update.cpp

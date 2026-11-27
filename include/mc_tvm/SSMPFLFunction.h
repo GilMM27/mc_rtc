@@ -26,6 +26,8 @@ namespace mc_tvm
 
 /** Fixed-size, pointwise SSM + PFL acceleration inequality for one robot.
  * A row is dt * J_n * alphaD <= v_budget - J_n * alpha - dt * Jdot_n * alpha.
+ * This low-level linear function is distinct from the position-level function
+ * used internally by mc_solver::SSMPFLConstraint.
  */
 class MC_TVM_DLLAPI SSMPFLFunction : public tvm::function::abstract::LinearFunction
 {

@@ -1,4 +1,5 @@
 #include <mc_solver/SSMPFLConstraint.h>
+#include "SSMPFLPositionFunction.h"
 
 #include <mc_solver/ConstraintSetLoader.h>
 #include <mc_solver/TVMQPSolver.h>
@@ -10,7 +11,6 @@
 #include <mc_rtc/logging.h>
 
 #include <tvm/Space.h>
-#include <tvm/task_dynamics/None.h>
 
 #include <algorithm>
 #include <cmath>
@@ -28,21 +28,30 @@ SSMPFLConstraint::SSMPFLConstraint(const mc_rbdyn::Robot & robot,
                                    double minMobility,
                                    double minMassEigenvalue,
                                    double weight)
-: weight_(weight),
-  slack_(weight > 0 ? tvm::Space(static_cast<int>(regions.size() * links.size())).createVariable("SSMPFL row slack") : nullptr),
-  function_(std::make_shared<mc_tvm::SSMPFLFunction>(robot,
-                                                    std::move(links),
-                                                    dt,
-                                                    std::move(regions),
-                                                    stoppingTime,
-                                                    minMobility,
-                                                    minMassEigenvalue,
-                                                    slack_)),
+: weight_(weight), dt_(dt),
+  slackRoot_(weight > 0 ? tvm::Space(static_cast<int>(regions.size() * links.size())).createVariable("SSMPFL slack root") : nullptr),
+  slack_(slackRoot_ ? tvm::dot(slackRoot_, 2) : nullptr),
+  function_(std::make_shared<details::DistanceFunction>(robot,
+                                                     std::move(links),
+                                                     dt,
+                                                     std::move(regions),
+                                                     stoppingTime,
+                                                     minMobility,
+                                                     minMassEigenvalue,
+                                                     slackRoot_)),
   monitored_(function_->pairs().size(), false), monitorRobotPoints_(function_->pairs().size(), Eigen::Vector3d::Zero()),
   monitorHumanPoints_(function_->pairs().size(), Eigen::Vector3d::Zero())
 {
+  if(slackRoot_)
+  {
+    slackRoot_->set(Eigen::VectorXd::Zero(pairs().size()));
+    tvm::dot(slackRoot_)->set(Eigen::VectorXd::Zero(pairs().size()));
+    slack_->set(Eigen::VectorXd::Zero(pairs().size()));
+  }
   if(backend_ != QPSolver::Backend::TVM) { throw std::invalid_argument("SSMPFLConstraint requires TVM backend"); }
   if(!std::isfinite(weight_) || weight_ < 0) { throw std::invalid_argument("invalid SSM+PFL weight"); }
+  if(weight_ > 0 && (!std::isfinite(weight_ * dt_ * dt_) || weight_ * dt_ * dt_ == 0))
+    throw std::invalid_argument("SSM+PFL weight and timestep produce an invalid slack penalty");
 }
 
 const std::vector<std::pair<std::string, std::string>> & SSMPFLConstraint::pairs() const noexcept { return function_->pairs(); }
@@ -73,7 +82,7 @@ double SSMPFLConstraint::softSlack(size_t row) const
 {
   if(row >= pairs().size()) { throw std::out_of_range("SSM+PFL row index"); }
   if(row >= function_->rowData().size()) { return 0.0; }
-  return slack_ ? std::max(0.0, slack_->value()[static_cast<int>(row)]) : 0.0;
+  return slack_ ? std::max(0.0, dt_ * slack_->value()[static_cast<int>(row)]) : 0.0;
 }
 
 void SSMPFLConstraint::addToSolverImpl(QPSolver & solver)
@@ -81,12 +90,12 @@ void SSMPFLConstraint::addToSolverImpl(QPSolver & solver)
   auto & problem = TVMQPSolver::from_solver(solver).problem();
   gui_ = solver.gui();
   logger_ = solver.logger();
-  task_ = problem.add(function_ <= 0., tvm::task_dynamics::None(), {tvm::requirements::PriorityLevel(0)});
+  task_ = problem.add(function_ >= 0., details::BudgetDynamics(function_), {tvm::requirements::PriorityLevel(0)});
   if(slack_)
   {
     slackBound_ = problem.add(slack_ >= 0., {tvm::requirements::PriorityLevel(0)});
     slackObjective_ =
-        problem.add(slack_ == 0., {tvm::requirements::PriorityLevel(1), tvm::requirements::Weight(weight_)});
+        problem.add(slack_ == 0., {tvm::requirements::PriorityLevel(1), tvm::requirements::Weight(weight_ * dt_ * dt_)});
   }
   addPairDiagnostics(solver);
 }
