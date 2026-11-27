@@ -16,21 +16,25 @@ namespace mc_tvm
 {
 
 SSMPFLFunction::SSMPFLFunction(const mc_rbdyn::Robot & robot,
-                               unsigned int capacity,
+                               std::vector<std::string> links,
                                double dt,
                                std::map<std::string, RegionParameters> regions,
                                double stoppingTime,
                                double minMobility,
                                double minMassEigenvalue,
                                tvm::VariablePtr slack)
-: tvm::function::abstract::LinearFunction(static_cast<int>(capacity)), robot_(robot), capacity_(capacity), dt_(dt),
+: tvm::function::abstract::LinearFunction(static_cast<int>(regions.size() * links.size())), robot_(robot), dt_(dt),
   regions_(std::move(regions)), stoppingTime_(stoppingTime), minMobility_(minMobility),
   minMassEigenvalue_(minMassEigenvalue), slack_(std::move(slack)), inertia_(robot.mb()),
-  rawA_(Eigen::MatrixXd::Zero(capacity, robot.mb().nrDof())), rawUpper_(Eigen::VectorXd::Zero(capacity)),
-  scaledA_(rawA_), slackA_(Eigen::MatrixXd::Zero(capacity, capacity)), scaledUpper_(rawUpper_)
+  fullJacobian_(6, robot.mb().nrDof()), fullJacobianDot_(6, robot.mb().nrDof()),
+  rawA_(Eigen::MatrixXd::Zero(regions_.size() * links.size(), robot.mb().nrDof())),
+  rawUpper_(Eigen::VectorXd::Zero(regions_.size() * links.size())), scaledA_(rawA_),
+  slackA_(Eigen::MatrixXd::Zero(rawA_.rows(), rawA_.rows())), scaledUpper_(rawUpper_), nextRawA_(rawA_),
+  nextRawUpper_(rawUpper_), nextScaledA_(scaledA_), nextSlackA_(slackA_), nextScaledUpper_(scaledUpper_)
 {
-  if(capacity == 0 || !std::isfinite(dt) || dt <= 0 || !std::isfinite(stoppingTime) || stoppingTime <= 0
-     || !std::isfinite(minMobility) || minMobility < 0 || !std::isfinite(minMassEigenvalue) || minMassEigenvalue <= 0)
+  if(links.empty() || regions_.empty() || !std::isfinite(dt) || dt <= 0 || !std::isfinite(stoppingTime)
+     || stoppingTime <= 0 || !std::isfinite(minMobility) || minMobility < 0 || !std::isfinite(minMassEigenvalue)
+     || minMassEigenvalue <= 0)
     throw std::invalid_argument("invalid SSM+PFL function settings");
   for(const auto & [name, p] : regions_)
   {
@@ -38,9 +42,19 @@ SSMPFLFunction::SSMPFLFunction(const mc_rbdyn::Robot & robot,
        || p.stiffnessNPerM <= 0 || !std::isfinite(p.distanceMarginM) || p.distanceMarginM < 0)
       throw std::invalid_argument("invalid SSM+PFL region parameters");
   }
-  if(regions_.empty()) { throw std::invalid_argument("SSM+PFL requires at least one region"); }
-  if(slack_ && slack_->size() != static_cast<int>(capacity))
-    throw std::invalid_argument("SSM+PFL slack size does not match capacity");
+  for(const auto & regionEntry : regions_)
+  {
+    const auto & region = regionEntry.first;
+    for(const auto & link : links)
+    {
+      if(link.empty() || !pairIndices_.emplace(std::make_pair(region, link), pairs_.size()).second)
+        throw std::invalid_argument("invalid or duplicate SSM+PFL link");
+      pairs_.emplace_back(region, link);
+    }
+  }
+  if(slack_ && slack_->size() != static_cast<int>(pairs_.size()))
+    throw std::invalid_argument("SSM+PFL slack size does not match pair count");
+  nextRows_.reserve(pairs_.size());
 
   registerUpdates(Update::Jacobian, &SSMPFLFunction::updateJacobian, Update::B, &SSMPFLFunction::updateb);
   addOutputDependency<SSMPFLFunction>(Output::Jacobian, Update::Jacobian);
@@ -58,15 +72,22 @@ void SSMPFLFunction::clear()
   slackA_.setZero();
   scaledUpper_.setZero();
   rowData_.clear();
+  measurements_.clear();
 }
 
 void SSMPFLFunction::setMeasurements(const std::vector<Measurement> & measurements)
 {
-  if(measurements.size() > capacity_) { throw std::invalid_argument("too many SSM+PFL measurements"); }
-  if(measurements.empty())
+  if(measurements.size() != pairs_.size()) { throw std::invalid_argument("incomplete SSM+PFL measurement batch"); }
+  std::vector<Measurement> ordered(pairs_.size());
+  std::vector<bool> seen(pairs_.size(), false);
+  for(const auto & measurement : measurements)
   {
-    clear();
-    return;
+    const auto it = pairIndices_.find({measurement.region, measurement.link});
+    if(it == pairIndices_.end()) throw std::domain_error("unknown SSM+PFL pair");
+    const auto index = it->second;
+    if(seen[index]) throw std::domain_error("duplicate SSM+PFL pair");
+    seen[index] = true;
+    ordered[index] = measurement;
   }
   const auto & mb = robot_.mb();
   const auto & mbc = robot_.mbc();
@@ -80,30 +101,40 @@ void SSMPFLFunction::setMeasurements(const std::vector<Measurement> & measuremen
   if(factor.info() != Eigen::Success || factor.vectorD().minCoeff() < minMassEigenvalue_)
     throw std::domain_error("robot inertia is not positive definite");
 
-  Eigen::MatrixXd nextRawA = Eigen::MatrixXd::Zero(capacity_, dofs);
-  Eigen::VectorXd nextRawUpper = Eigen::VectorXd::Zero(capacity_);
-  Eigen::MatrixXd nextScaledA = nextRawA;
-  Eigen::MatrixXd nextSlackA = Eigen::MatrixXd::Zero(capacity_, capacity_);
-  Eigen::VectorXd nextScaledUpper = nextRawUpper;
-  std::vector<RowData> nextRows;
-  nextRows.reserve(measurements.size());
+  auto & nextRawA = nextRawA_;
+  auto & nextRawUpper = nextRawUpper_;
+  auto & nextScaledA = nextScaledA_;
+  auto & nextSlackA = nextSlackA_;
+  auto & nextScaledUpper = nextScaledUpper_;
+  auto & nextRows = nextRows_;
+  nextRawA.setZero();
+  nextRawUpper.setZero();
+  nextScaledA.setZero();
+  nextSlackA.setZero();
+  nextScaledUpper.setZero();
+  nextRows.clear();
   for(size_t i = 0; i < measurements.size(); ++i)
   {
-    const auto & m = measurements[i];
+    const auto & m = ordered[i];
     const auto region = regions_.find(m.region);
     if(region == regions_.end() || !std::isfinite(m.distance) || m.distance < 0 || !m.robotPointBodyLocal.allFinite()
-       || !m.normal.allFinite() || !m.humanVelocity.allFinite())
+       || !m.normal.allFinite() || !m.humanVelocity.allFinite()
+       || (m.witnessesValid && (!m.robotPointWorld.allFinite() || !m.humanPointWorld.allFinite())))
       throw std::domain_error("invalid SSM+PFL pair measurement");
     const double normalNorm = m.normal.norm();
     if(!std::isfinite(normalNorm) || normalNorm < 1e-9) throw std::domain_error("invalid SSM+PFL pair normal");
     const Eigen::Vector3d normal = m.normal / normalNorm;
-    rbd::Jacobian jacobian(mb, m.robotBody, m.robotPointBodyLocal);
-    Eigen::MatrixXd full(6, dofs), fullDot(6, dofs);
-    jacobian.fullJacobian(mb, jacobian.jacobian(mb, mbc), full);
-    jacobian.fullJacobian(mb, jacobian.jacobianDot(mb, mbc), fullDot);
-    if(!full.allFinite() || !fullDot.allFinite()) throw std::domain_error("invalid SSM+PFL point Jacobian");
+    auto jacobianIt = jacobians_.find(m.robotBody);
+    if(jacobianIt == jacobians_.end())
+      jacobianIt = jacobians_.try_emplace(m.robotBody, mb, m.robotBody).first;
+    auto & jacobian = jacobianIt->second;
+    jacobian.point(m.robotPointBodyLocal);
+    jacobian.fullJacobian(mb, jacobian.jacobian(mb, mbc), fullJacobian_);
+    jacobian.fullJacobian(mb, jacobian.jacobianDot(mb, mbc), fullJacobianDot_);
+    if(!fullJacobian_.allFinite() || !fullJacobianDot_.allFinite())
+      throw std::domain_error("invalid SSM+PFL point Jacobian");
     RowData row;
-    row.directionalJacobian = normal.transpose() * full.bottomRows(3);
+    row.directionalJacobian = normal.transpose() * fullJacobian_.bottomRows(3);
     const double mobility = row.directionalJacobian.dot(factor.solve(row.directionalJacobian.transpose()));
     if(!std::isfinite(mobility) || mobility < -minMobility_)
       throw std::domain_error("invalid SSM+PFL directional inverse mass");
@@ -112,7 +143,7 @@ void SSMPFLFunction::setMeasurements(const std::vector<Measurement> & measuremen
     const double combinedSpeed = std::max(m.distance - p.distanceMarginM, 0.0) / stoppingTime_ + pflSpeed;
     row.robotSpeedBudget = std::max(0.0, combinedSpeed + normal.dot(m.humanVelocity));
     row.robotApproach = row.directionalJacobian.dot(qdot);
-    row.jacobianDrift = (normal.transpose() * fullDot.bottomRows(3) * qdot).value();
+    row.jacobianDrift = (normal.transpose() * fullJacobianDot_.bottomRows(3) * qdot).value();
     row.accelerationBound = row.robotSpeedBudget - row.robotApproach - dt_ * row.jacobianDrift;
     if(!std::isfinite(pflSpeed) || !std::isfinite(combinedSpeed) || !std::isfinite(row.robotSpeedBudget)
        || !std::isfinite(row.robotApproach) || !std::isfinite(row.jacobianDrift)
@@ -132,6 +163,7 @@ void SSMPFLFunction::setMeasurements(const std::vector<Measurement> & measuremen
   slackA_.swap(nextSlackA);
   scaledUpper_.swap(nextScaledUpper);
   rowData_.swap(nextRows);
+  measurements_.swap(ordered);
 }
 
 void SSMPFLFunction::updateJacobian()
@@ -141,6 +173,8 @@ void SSMPFLFunction::updateJacobian()
 }
 
 void SSMPFLFunction::updateb()
-{ b_ = -scaledUpper_; }
+{
+  b_ = -scaledUpper_;
+}
 
 } // namespace mc_tvm

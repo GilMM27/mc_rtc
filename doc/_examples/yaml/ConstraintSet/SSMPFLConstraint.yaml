@@ -1,6 +1,10 @@
+# TVM SSM+PFL acceleration constraint with fixed region/link pairs.
+# The controller supplies a complete fresh snapshot and clears the constraint
+# and skips the QP whenever the snapshot is unavailable or invalid.
+# Weight is optional and penalizes per-pair speed slack in m/s.
 type: ssmPfl
 robot: MainRobot
-capacity: 2
+Links: [joint_1, joint_2]
 StoppingTimeSeconds: 0.5
 Regions:
   hand: { ForceMaxN: 140, StiffnessNPerM: 75000, DistanceMarginM: 0.05 }

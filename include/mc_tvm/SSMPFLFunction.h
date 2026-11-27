@@ -6,12 +6,14 @@
 #include <tvm/function/abstract/LinearFunction.h>
 
 #include <RBDyn/FD.h>
+#include <RBDyn/Jacobian.h>
 #include <Eigen/Core>
 
 #include <map>
 #include <memory>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 namespace mc_rbdyn
@@ -42,12 +44,16 @@ public:
   struct Measurement
   {
     std::string region;
+    std::string link;
     std::string robotBody;
     Eigen::Vector3d robotPointBodyLocal = Eigen::Vector3d::Zero();
     /** Unit direction from the robot witness toward the human witness. */
     Eigen::Vector3d normal = Eigen::Vector3d::Zero();
     Eigen::Vector3d humanVelocity = Eigen::Vector3d::Zero();
     double distance = 0;
+    Eigen::Vector3d robotPointWorld = Eigen::Vector3d::Zero();
+    Eigen::Vector3d humanPointWorld = Eigen::Vector3d::Zero();
+    bool witnessesValid = false;
   };
 
   struct RowData
@@ -60,7 +66,7 @@ public:
   };
 
   SSMPFLFunction(const mc_rbdyn::Robot & robot,
-                 unsigned int capacity,
+                 std::vector<std::string> links,
                  double dt,
                  std::map<std::string, RegionParameters> regions,
                  double stoppingTime,
@@ -72,7 +78,8 @@ public:
   void setMeasurements(const std::vector<Measurement> & measurements);
   void clear();
 
-  unsigned int capacity() const noexcept { return capacity_; }
+  const std::vector<std::pair<std::string, std::string>> & pairs() const noexcept { return pairs_; }
+  const std::vector<Measurement> & measurements() const noexcept { return measurements_; }
   const std::map<std::string, RegionParameters> & regions() const noexcept { return regions_; }
   const std::vector<RowData> & rowData() const noexcept { return rowData_; }
   const Eigen::MatrixXd & rows() const noexcept { return rawA_; }
@@ -84,7 +91,9 @@ protected:
 
 private:
   const mc_rbdyn::Robot & robot_;
-  const unsigned int capacity_;
+  std::vector<std::pair<std::string, std::string>> pairs_;
+  std::map<std::pair<std::string, std::string>, size_t> pairIndices_;
+  std::vector<Measurement> measurements_;
   const double dt_;
   const std::map<std::string, RegionParameters> regions_;
   const double stoppingTime_;
@@ -92,12 +101,21 @@ private:
   const double minMassEigenvalue_;
   tvm::VariablePtr slack_;
   rbd::ForwardDynamics inertia_;
+  std::unordered_map<std::string, rbd::Jacobian> jacobians_;
+  Eigen::MatrixXd fullJacobian_;
+  Eigen::MatrixXd fullJacobianDot_;
   Eigen::MatrixXd rawA_;
   Eigen::VectorXd rawUpper_;
   Eigen::MatrixXd scaledA_;
   Eigen::MatrixXd slackA_;
   Eigen::VectorXd scaledUpper_;
   std::vector<RowData> rowData_;
+  Eigen::MatrixXd nextRawA_;
+  Eigen::VectorXd nextRawUpper_;
+  Eigen::MatrixXd nextScaledA_;
+  Eigen::MatrixXd nextSlackA_;
+  Eigen::VectorXd nextScaledUpper_;
+  std::vector<RowData> nextRows_;
 };
 
 using SSMPFLFunctionPtr = std::shared_ptr<SSMPFLFunction>;
